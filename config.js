@@ -43,7 +43,7 @@ GUILD_CONFIGS.push({
 if (process.env.GUILD_ID_2) {
   GUILD_CONFIGS.push({
     guildId: process.env.GUILD_ID_2,
-    adminRoleIds: parseIds(optEnv('ADMIN_ROLE_ID')),
+    adminRoleIds: parseIds(optEnv('G2_ADMIN_ROLE_ID')),
     channels: {
       morning: {
         mola: [optEnv('G2_MORNING_MOLA_CHANNEL_ID')].filter(Boolean),

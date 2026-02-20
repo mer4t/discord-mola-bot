@@ -115,7 +115,10 @@ function clampRights(user) {
   user.freeRights['20'] = Math.max(0, Math.min(user.freeRights['20'], 1));
 }
 
-function resetUserForNewShift(user, guild, userId) {
+function resetUserForNewShift(user, guild, userId, now) {
+  if (user.activeBreak) {
+    logBreakClose(user, user.activeBreak, 'auto', now);
+  }
   user.freeRights = { '10': 2, '20': 1 };
   // Preserve admin-created pending rezs (they were created without consuming rights)
   user.rez = (user.rez || []).filter((r) => r.adminCreated && r.status === 'pending');
@@ -148,6 +151,7 @@ function logBreakClose(user, breakData, closedBy, now) {
     duration: breakData.typeMins,
     isAcil: breakData.isAcil || false,
     isExtra: breakData.isExtra || false,
+    isAdminBreak: breakData.isAdminBreak || false,
     startAtMs: breakData.startAtMs,
     endAtMs: now.toMillis(),
     scheduledEndAtMs: breakData.scheduledEndAtMs,
@@ -468,14 +472,13 @@ function runMaintenance(dbGuild, guildId, now) {
 
     const dueCloseAt = b.scheduledEndAtMs + AUTO_CLOSE_MS;
     if (nowMs >= dueCloseAt) {
-      const closeAt = dueCloseAt;
-      const lateMin = Math.max(0, Math.floor((closeAt - b.scheduledEndAtMs) / 60000));
+      const lateMin = Math.max(0, Math.floor((nowMs - b.scheduledEndAtMs) / 60000));
 
-      const closeNow = DateTime.fromMillis(closeAt).setZone(TZ);
+      const closeNow = DateTime.fromMillis(nowMs).setZone(TZ);
       logBreakClose(u, b, 'auto', closeNow);
       u.activeBreak = null;
-      if (!b.isAcil) {
-        u.lastNormalBreakClosedAtMs = closeAt;
+      if (!b.isAcil && !b.isAdminBreak) {
+        u.lastNormalBreakClosedAtMs = dueCloseAt;
       }
 
       logger.info('Auto-close: userId=' + userId + ' ' + b.typeMins + 'dk geç=' + lateMin + 'dk [' + b.poolKey + ']');
@@ -561,8 +564,8 @@ async function flushOutbox(outbox) {
           await ch.send(m.content);
         }
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      logger.warn('Mesaj gönderilemedi ch=' + m.channelId + ': ' + err.message);
     }
   }
 }
@@ -1192,7 +1195,7 @@ async function handleInteraction(interaction) {
     if (shiftBounds) {
       const shiftStartMs = shiftBounds.start.toMillis();
       if (user.lastResetShiftStartMs !== shiftStartMs) {
-        resetUserForNewShift(user, guild, interaction.user.id);
+        resetUserForNewShift(user, guild, interaction.user.id, now);
         user.lastResetShiftStartMs = shiftStartMs;
       }
     }
@@ -1485,7 +1488,7 @@ async function handleInteraction(interaction) {
       const closeAtMs = floorToMinuteMs(nowMs);
       logBreakClose(user, b, 'user', now);
       user.activeBreak = null;
-      if (!b.isAcil) user.lastNormalBreakClosedAtMs = closeAtMs;
+      if (!b.isAcil && !b.isAdminBreak) user.lastNormalBreakClosedAtMs = closeAtMs;
 
       let embed;
       if (lateMin > 2) { embed = warnEmbed(mention(interaction.user.id) + ' — Mola sonlandırıldı.\n⏳ Geç kalma süresi: **' + lateMin + ' dk**'); }
