@@ -26,7 +26,7 @@ const TZ = CONFIG.timezone;
 const FIRST_LAST_BLOCK_MIN = 30;
 const MAX_REZ_AHEAD_HOURS = 2;
 const REZ_START_WINDOW_MIN = 5;
-const AUTO_CLOSE_GRACE_MIN = 5;
+const AUTO_CLOSE_GRACE_MIN = 2;
 const MIN_SHORT_BREAK_MIN = 5;
 const REZ_CREATION_COOLDOWN_MIN = 30;
 
@@ -105,6 +105,7 @@ function getGuildConfig(guildId) {
 function pushToPool(outbox, guildId, poolKey, type, embeds) {
   const cfg = getGuildConfig(guildId);
   if (!cfg) return;
+  if (!cfg.channels[poolKey]) return;
   for (const chId of cfg.channels[poolKey][type]) {
     outbox.push({ channelId: chId, embeds });
   }
@@ -120,8 +121,9 @@ function resetUserForNewShift(user, guild, userId, now) {
     logBreakClose(user, user.activeBreak, 'auto', now);
   }
   user.freeRights = { '10': 2, '20': 1 };
-  // Preserve admin-created pending rezs (they were created without consuming rights)
-  user.rez = (user.rez || []).filter((r) => r.adminCreated && r.status === 'pending');
+  // Preserve admin-created pending rezs that are still in the future (they were created without consuming rights)
+  const nowMs = now.toMillis();
+  user.rez = (user.rez || []).filter((r) => r.adminCreated && r.status === 'pending' && r.startAtMs > nowMs);
   user.activeBreak = null;
   user.lastNormalBreakClosedAtMs = null;
   // Remove waitlist entries for this user
@@ -133,7 +135,7 @@ function mention(userId) {
 }
 
 const POOL_KEY_TR = { morning: 'Sabah', evening: 'Akşam', night: 'Gece' };
-const MOLA_COMMANDS = new Set(['mola', 'acil', 'devam', 'hak', 'ekstra']);
+const MOLA_COMMANDS = new Set(['mola', 'acil', 'devam', 'ekstra']);
 const REZ_COMMANDS = new Set(['rez', 'rezliste', 'reziptal']);
 function poolKeyTR(key) {
   return POOL_KEY_TR[key] || key;
@@ -214,7 +216,7 @@ function getActiveBreakIntervals(dbGuild, poolKey, duration) {
     if (b.poolKey !== poolKey) continue;
     if (b.typeMins !== duration) continue;
     const startAtMs = b.startAtMs;
-    const endAtMs = b.autoCloseAtMs;
+    const endAtMs = b.scheduledEndAtMs;
     intervals.push({ userId, startAtMs, endAtMs });
   }
   return intervals;
@@ -445,7 +447,7 @@ function runMaintenance(dbGuild, guildId, now) {
           mention(userId) + ' — Rezervasyon süresi doldu: **' +
           r.duration + ' dk — ' +
           formatHM(DateTime.fromMillis(r.startAtMs).setZone(TZ)) +
-          '** (5 dk içinde başlatılmadı).' +
+          '** (' + REZ_START_WINDOW_MIN + ' dk içinde başlatılmadı).' +
           (r.adminCreated ? '' : ' Hak iade edildi.')
         )]);
       }
@@ -556,7 +558,10 @@ function runMaintenance(dbGuild, guildId, now) {
 async function flushOutbox(outbox) {
   for (const m of outbox) {
     try {
-      const ch = client.channels.cache.get(m.channelId);
+      let ch = client.channels.cache.get(m.channelId);
+      if (!ch) {
+        try { ch = await client.channels.fetch(m.channelId); } catch { /* channel not accessible */ }
+      }
       if (ch && ch.isTextBased()) {
         if (m.embeds) {
           await ch.send({ embeds: m.embeds });
@@ -588,6 +593,17 @@ async function handleInteraction(interaction) {
 
     const sub = interaction.options.getSubcommand();
 
+    // Pre-fetch member outside of DB lock to avoid blocking mutex with Discord API calls
+    let prefetchedMember = null;
+    if (sub === 'kullanici') {
+      const targetUserPre = interaction.options.getUser('kullanici');
+      if (targetUserPre) {
+        try {
+          prefetchedMember = await interaction.guild.members.fetch(targetUserPre.id);
+        } catch { /* member not found or fetch failed */ }
+      }
+    }
+
     const result = await withDbLock(async () => {
       const db = await loadDb();
       const guild = ensureGuild(db, interaction.guildId);
@@ -595,9 +611,71 @@ async function handleInteraction(interaction) {
       const outbox = runMaintenance(guild, interaction.guildId, now);
 
       if (sub === 'rapor') {
-        const havuzInput = interaction.options.getString('havuz', true);
+        const havuzInput = interaction.options.getString('havuz') || null;
         const tarihInput = interaction.options.getString('tarih') || null;
         const donem = interaction.options.getString('donem') || 'gun';
+
+        const targetDay = parseDateInput(tarihInput, TZ);
+        if (!targetDay) {
+          await replyAdmin(interaction, errEmbed('Geçersiz tarih formatı.\nÖrnek: `17.02.2026`, `bugun`, `dun`'));
+          await saveDb(db);
+          return { outbox };
+        }
+
+        let rangeStart, rangeEnd, dateLabel;
+        if (donem === 'hafta') {
+          const range = getWeekRange(targetDay);
+          rangeStart = range.start; rangeEnd = range.end;
+          dateLabel = formatDate(rangeStart) + ' – ' + formatDate(rangeEnd);
+        } else if (donem === 'ay') {
+          const range = getMonthRange(targetDay);
+          rangeStart = range.start; rangeEnd = range.end;
+          dateLabel = formatDate(rangeStart) + ' – ' + formatDate(rangeEnd);
+        } else {
+          rangeStart = targetDay; rangeEnd = targetDay;
+          dateLabel = formatDate(targetDay);
+        }
+
+        const donemLabel = donem === 'hafta' ? ' (Haftalık)' : donem === 'ay' ? ' (Aylık)' : '';
+
+        function collectPoolLogs(pk) {
+          const logs = [];
+          for (const [uid, u] of Object.entries(guild.users)) {
+            for (const log of u.breakLog || []) {
+              if (log.poolKey !== pk) continue;
+              if (donem === 'gun') {
+                if (log.shiftDate !== formatDate(targetDay)) continue;
+              } else {
+                if (!isDateInRange(log.shiftDate, rangeStart, rangeEnd)) continue;
+              }
+              logs.push({ userId: uid, ...log });
+            }
+          }
+          return logs;
+        }
+
+        // Genel özet — havuz seçilmemişse
+        if (!havuzInput) {
+          const desc = [];
+          let totalAllPools = 0;
+          for (const pk of ['morning', 'evening', 'night']) {
+            const logs = collectPoolLogs(pk);
+            totalAllPools += logs.length;
+            const uniqueU = new Set(logs.map((l) => l.userId)).size;
+            const totalDur = logs.reduce((s, l) => s + l.duration, 0);
+            const latePersons = new Set(logs.filter((l) => l.lateMin > 0).map((l) => l.userId)).size;
+            const avgDur = logs.length > 0 ? Math.round(totalDur / logs.length) : 0;
+            desc.push('**' + poolKeyTR(pk) + '** — ' + logs.length + ' mola · ' + totalDur + ' dk · ' + uniqueU + ' kişi · ort. ' + avgDur + ' dk · ' + latePersons + ' kişi geç');
+          }
+          if (totalAllPools === 0) {
+            desc.push('');
+            desc.push('ℹ️ Bu tarih için kayıt bulunamadı.');
+          }
+          await replyAdmin(interaction, adminEmbed('📊 Genel Özet' + donemLabel + ' | ' + dateLabel, desc.join('\n')));
+          logger.info('Genel rapor görüntülendi: ' + donem + ' ' + dateLabel + ' by ' + interaction.user.tag);
+          await saveDb(db);
+          return { outbox };
+        }
 
         const poolMap = { sabah: 'morning', aksam: 'evening', gece: 'night' };
         const poolKey = poolMap[havuzInput];
@@ -607,54 +685,13 @@ async function handleInteraction(interaction) {
           return { outbox };
         }
 
-        const targetDay = parseDateInput(tarihInput, TZ);
-        if (!targetDay) {
-          await replyAdmin(interaction, errEmbed('Geçersiz tarih formatı.\nÖrnek: `17.02.2026`, `bugun`, `dun`'));
-          await saveDb(db);
-          return { outbox };
-        }
-
-        // Determine date range and title based on donem
-        let rangeStart, rangeEnd, dateLabel;
-        if (donem === 'hafta') {
-          const range = getWeekRange(targetDay);
-          rangeStart = range.start;
-          rangeEnd = range.end;
-          dateLabel = formatDate(rangeStart) + ' – ' + formatDate(rangeEnd);
-        } else if (donem === 'ay') {
-          const range = getMonthRange(targetDay);
-          rangeStart = range.start;
-          rangeEnd = range.end;
-          dateLabel = formatDate(rangeStart) + ' – ' + formatDate(rangeEnd);
-        } else {
-          // gun (default)
-          rangeStart = targetDay;
-          rangeEnd = targetDay;
-          dateLabel = formatDate(targetDay);
-        }
-
-        const allLogs = [];
-        const datesWithData = new Set();
-        for (const [uid, u] of Object.entries(guild.users)) {
-          for (const log of u.breakLog || []) {
-            if (log.poolKey !== poolKey) continue;
-            if (donem === 'gun') {
-              if (log.shiftDate !== formatDate(targetDay)) continue;
-            } else {
-              if (!isDateInRange(log.shiftDate, rangeStart, rangeEnd)) continue;
-            }
-            allLogs.push({ userId: uid, ...log });
-            datesWithData.add(log.shiftDate);
-          }
-        }
+        const allLogs = collectPoolLogs(poolKey);
+        const datesWithData = new Set(allLogs.map((l) => l.shiftDate));
 
         const userBreaks = {};
         const userLateTotal = {};
-        let normalCount = 0;
-        let acilCount = 0;
-        let ekstraCount = 0;
-        let totalDuration = 0;
-        let autoCloseList = [];
+        let normalCount = 0, acilCount = 0, ekstraCount = 0, totalDuration = 0;
+        const autoCloseList = [];
         const acilUsers = new Set();
 
         for (const l of allLogs) {
@@ -666,6 +703,11 @@ async function handleInteraction(interaction) {
         }
 
         const uniqueUsers = Object.keys(userBreaks).length;
+        const avgDuration = allLogs.length > 0 ? Math.round(totalDuration / allLogs.length) : 0;
+        const lateUserList = Object.entries(userLateTotal);
+        const totalLateAll = lateUserList.reduce((s, [, v]) => s + v, 0);
+        const avgLatePerPerson = lateUserList.length > 0 ? Math.round(totalLateAll / lateUserList.length) : 0;
+
         const desc = [];
 
         if (donem !== 'gun' && datesWithData.size > 0) {
@@ -680,25 +722,21 @@ async function handleInteraction(interaction) {
 
         desc.push('👥 Toplam mola kullanan: **' + uniqueUsers + '** kişi');
         desc.push('☕ Toplam mola: **' + allLogs.length + '** (Normal: ' + normalCount + ' | Acil: ' + acilCount + (ekstraCount ? ' | Ekstra: ' + ekstraCount : '') + ')');
-        desc.push('⏱️ Toplam mola süresi: **' + totalDuration + ' dk**');
-
-        const topUsers = Object.entries(userBreaks).sort((a, b) => b[1] - a[1]).slice(0, 5);
-        if (topUsers.length) {
-          desc.push('');
-          desc.push('🏆 **En çok mola kullanan:**');
-          topUsers.forEach(([uid, count], i) => {
-            const totalMin = allLogs.filter((l) => l.userId === uid).reduce((s, l) => s + l.duration, 0);
-            desc.push((i + 1) + '. ' + mention(uid) + ' — ' + count + ' mola (' + totalMin + ' dk)');
-          });
+        desc.push('⏱️ Toplam mola süresi: **' + totalDuration + ' dk** · Ortalama: **' + avgDuration + ' dk**');
+        if (lateUserList.length > 0) {
+          desc.push('⚠️ Geç kalan: **' + lateUserList.length + '** kişi · Kişi başı ort. geç: **' + avgLatePerPerson + ' dk**');
         }
 
-        const topLate = Object.entries(userLateTotal).sort((a, b) => b[1] - a[1]).slice(0, 5);
-        if (topLate.length) {
+        // Tam kullanıcı listesi
+        const allUsersSorted = Object.entries(userBreaks).sort((a, b) => b[1] - a[1]);
+        if (allUsersSorted.length) {
           desc.push('');
-          desc.push('⚠️ **En çok geç kalan:**');
-          topLate.forEach(([uid, totalLate], i) => {
-            const lateCount = allLogs.filter((l) => l.userId === uid && l.lateMin > 0).length;
-            desc.push((i + 1) + '. ' + mention(uid) + ' — toplam ' + totalLate + ' dk geç (' + lateCount + ' mola)');
+          desc.push('**📋 Mola kullananlar:**');
+          allUsersSorted.forEach(([uid, count], i) => {
+            const totalMin = allLogs.filter((l) => l.userId === uid).reduce((s, l) => s + l.duration, 0);
+            const lateMin = userLateTotal[uid] || 0;
+            const lateText = lateMin > 0 ? ' · ' + lateMin + ' dk geç' : '';
+            desc.push((i + 1) + '. ' + mention(uid) + ' — ' + count + ' mola (' + totalMin + ' dk' + lateText + ')');
           });
         }
 
@@ -706,7 +744,7 @@ async function handleInteraction(interaction) {
           desc.push('');
           desc.push('🔴 **Otomatik kapatılan:** ' + autoCloseList.length);
           for (const l of autoCloseList.slice(0, 10)) {
-            desc.push('• ' + mention(l.userId) + ' — ' + l.duration + 'dk mola, ' + l.lateMin + ' dk geç');
+            desc.push('• ' + mention(l.userId) + ' — ' + l.duration + 'dk, ' + l.lateMin + ' dk geç');
           }
         }
 
@@ -715,12 +753,36 @@ async function handleInteraction(interaction) {
           desc.push('🚨 Acil mola kullanan: ' + [...acilUsers].map((uid) => mention(uid)).join(', '));
         }
 
+        // Saatlik yoğunluk
+        if (allLogs.length > 0) {
+          const hourlyCounts = {};
+          for (const l of allLogs) {
+            const hour = DateTime.fromMillis(l.startAtMs).setZone(TZ).hour;
+            hourlyCounts[hour] = (hourlyCounts[hour] || 0) + 1;
+          }
+          const maxCount = Math.max(...Object.values(hourlyCounts));
+          const BAR_WIDTH = 10;
+          const hourLines = [];
+          for (let h = 0; h < 24; h++) {
+            if (!hourlyCounts[h]) continue;
+            const count = hourlyCounts[h];
+            const barLen = Math.max(1, Math.round((count / maxCount) * BAR_WIDTH));
+            hourLines.push(String(h).padStart(2, '0') + ':00  ' + '█'.repeat(barLen).padEnd(BAR_WIDTH + 1) + count);
+          }
+          if (hourLines.length) {
+            desc.push('');
+            desc.push('📊 **Saatlik Yoğunluk:**');
+            desc.push('```');
+            desc.push(...hourLines);
+            desc.push('```');
+          }
+        }
+
         if (!allLogs.length) {
           desc.push('');
           desc.push('ℹ️ Bu tarih aralığı ve havuz için kayıt bulunamadı.');
         }
 
-        const donemLabel = donem === 'hafta' ? ' (Haftalık)' : donem === 'ay' ? ' (Aylık)' : '';
         let descText = desc.join('\n');
         if (descText.length > 4000) {
           descText = descText.slice(0, 3950) + '\n\n⚠️ *Rapor çok uzun, kısaltıldı.*';
@@ -734,6 +796,7 @@ async function handleInteraction(interaction) {
       if (sub === 'kullanici') {
         const targetUser = interaction.options.getUser('kullanici', true);
         const tarihInput = interaction.options.getString('tarih') || null;
+        const tarih2Input = interaction.options.getString('tarih2') || null;
 
         const targetDay = parseDateInput(tarihInput, TZ);
         if (!targetDay) {
@@ -742,9 +805,26 @@ async function handleInteraction(interaction) {
           return { outbox };
         }
 
-        const targetDateStr = formatDate(targetDay);
-        const u = guild.users[targetUser.id];
+        let rangeStart, rangeEnd, dateLabel;
+        if (tarih2Input) {
+          const targetDay2 = parseDateInput(tarih2Input, TZ);
+          if (!targetDay2) {
+            await replyAdmin(interaction, errEmbed('Geçersiz tarih2 formatı.\nÖrnek: `17.02.2026`, `bugun`, `dun`'));
+            await saveDb(db);
+            return { outbox };
+          }
+          if (targetDay2 < targetDay) {
+            rangeStart = targetDay2; rangeEnd = targetDay;
+          } else {
+            rangeStart = targetDay; rangeEnd = targetDay2;
+          }
+          dateLabel = formatDate(rangeStart) + ' – ' + formatDate(rangeEnd);
+        } else {
+          rangeStart = targetDay; rangeEnd = targetDay;
+          dateLabel = formatDate(targetDay);
+        }
 
+        const u = guild.users[targetUser.id];
         if (!u) {
           await replyAdmin(interaction, errEmbed('Bu kullanıcıya ait kayıt bulunamadı.'));
           await saveDb(db);
@@ -752,13 +832,21 @@ async function handleInteraction(interaction) {
         }
 
         const logs = (u.breakLog || [])
-          .filter((l) => l.shiftDate === targetDateStr)
+          .filter((l) => isDateInRange(l.shiftDate, rangeStart, rangeEnd))
           .sort((a, b) => a.startAtMs - b.startAtMs);
 
         const lines = [];
 
-        // Anlık durum bloğu
+        // Anlık durum
         lines.push('**— Anlık Durum —**');
+
+        let vardiyaLine = '—';
+        try {
+          const detectedVardiya = detectShiftFromNickname(getUserDisplayName(prefetchedMember));
+          if (detectedVardiya) vardiyaLine = poolKeyTR(detectedVardiya.poolKey) + ' (' + detectedVardiya.schedule.label + ')';
+        } catch { /* member detect fail */ }
+        lines.push('🏢 Vardiya: **' + vardiyaLine + '**');
+
         if (u.activeBreak) {
           const b = u.activeBreak;
           const endDt = DateTime.fromMillis(b.scheduledEndAtMs).setZone(TZ);
@@ -790,34 +878,61 @@ async function handleInteraction(interaction) {
         lines.push(hakLine);
         lines.push('');
 
+        // Mola geçmişi
         if (!logs.length) {
-          lines.push('ℹ️ Bu tarihte mola kaydı bulunamadı.');
+          lines.push('ℹ️ Bu tarih aralığında mola kaydı bulunamadı.');
         } else {
-          lines.push('```');
-          lines.push('Tür     Başlangıç  Bitiş    Süre   Geç     Kapanış');
-          lines.push('─────── ────────── ──────── ────── ─────── ──────────');
+          const totalMin = logs.reduce((s, l) => s + l.duration, 0);
+          const totalLate = logs.reduce((s, l) => s + (l.lateMin || 0), 0);
+          const autoCloseCount = logs.filter((l) => l.closedBy === 'auto').length;
+          const acilCount = logs.filter((l) => l.isAcil && !l.isExtra).length;
+          const lateCount = logs.filter((l) => l.lateMin > 0).length;
 
-          let totalMin = 0;
-          let totalLate = 0;
+          lines.push('**— Mola Geçmişi (' + dateLabel + ') —**');
+          lines.push('Özet: **' + logs.length + '** mola · **' + totalMin + ' dk** · Geç: **' + totalLate + ' dk** · Auto-close: **' + autoCloseCount + '** · Acil: **' + acilCount + '** · Geç kalan: **' + lateCount + '**');
+          lines.push('```');
+          lines.push('Tür     Tarih      Başlangıç  Bitiş    Süre   Geç     Kapanış');
+          lines.push('─────── ────────── ────────── ──────── ────── ─────── ──────────');
 
           for (const l of logs) {
             const type = l.isAdminBreak ? 'Admin  ' : l.isExtra ? 'Ekstra ' : l.isAcil ? 'Acil   ' : 'Normal ';
+            const dateStr = l.shiftDate ? l.shiftDate.slice(0, 5) : '  —  ';
             const start = DateTime.fromMillis(l.startAtMs).setZone(TZ).toFormat('HH:mm');
             const end = DateTime.fromMillis(l.endAtMs).setZone(TZ).toFormat('HH:mm');
             const dur = String(l.duration).padStart(2) + 'dk';
             const late = l.lateMin > 0 ? (String(l.lateMin).padStart(3) + ' dk') : '  —   ';
             const closed = l.closedBy === 'auto' ? 'auto-close' : l.closedBy === 'admin' ? 'admin     ' : '/devam    ';
-            lines.push(type + ' ' + start + '      ' + end + '    ' + dur + '   ' + late + '  ' + closed);
-            totalMin += l.duration;
-            totalLate += l.lateMin;
+            lines.push(type + ' ' + dateStr + '   ' + start + '      ' + end + '    ' + dur + '   ' + late + '  ' + closed);
           }
-
           lines.push('```');
-          lines.push('');
-          lines.push('Toplam mola: **' + logs.length + '** | Süre: **' + totalMin + ' dk** | Geç kalma: **' + totalLate + ' dk**');
         }
 
-        await replyAdmin(interaction, adminEmbed('👤 ' + mention(targetUser.id) + ' — ' + targetDateStr, lines.join('\n')));
+        // Rez geçmişi
+        const rezHistory = (u.rez || [])
+          .filter((r) => {
+            if (r.status === 'pending') return false;
+            const rezDayStr = DateTime.fromMillis(r.startAtMs).setZone(TZ).toFormat('dd.MM.yyyy');
+            return isDateInRange(rezDayStr, rangeStart, rangeEnd);
+          })
+          .sort((a, b) => a.startAtMs - b.startAtMs);
+
+        if (rezHistory.length) {
+          lines.push('');
+          lines.push('**— Rez Geçmişi (' + dateLabel + ') —**');
+          const statusLabel = { completed: 'kullanıldı', expired: 'süresi doldu', cancelled: 'iptal edildi', started: 'başlatıldı' };
+          for (const r of rezHistory) {
+            const startDt = DateTime.fromMillis(r.startAtMs).setZone(TZ);
+            const label = statusLabel[r.status] || r.status;
+            const adminTag = r.adminCreated ? ' *(admin)*' : '';
+            lines.push('• **' + r.duration + ' dk @ ' + startDt.toFormat('HH:mm') + '** — ' + label + ' (' + startDt.toFormat('dd.MM') + ')' + adminTag);
+          }
+        }
+
+        let kulText = lines.join('\n');
+        if (kulText.length > 4000) {
+          kulText = kulText.slice(0, 3950) + '\n\n⚠️ *Çok uzun, kısaltıldı.*';
+        }
+        await replyAdmin(interaction, adminEmbed('👤 ' + mention(targetUser.id) + ' — ' + dateLabel, kulText));
         await saveDb(db);
         return { outbox };
       }
@@ -889,7 +1004,7 @@ async function handleInteraction(interaction) {
         const b = targetUserObj.activeBreak;
         logBreakClose(targetUserObj, b, 'admin', now);
         targetUserObj.activeBreak = null;
-        if (!b.isAcil) targetUserObj.lastNormalBreakClosedAtMs = now.toMillis();
+        if (!b.isAcil && !b.isAdminBreak) targetUserObj.lastNormalBreakClosedAtMs = now.toMillis();
 
         const breakLabel = b.isExtra ? 'ekstra' : b.isAcil ? 'acil' : 'normal';
         logger.info('Admin mola bitirdi: ' + interaction.user.tag + ' → ' + targetUser.tag + ' ' + b.typeMins + 'dk [' + b.poolKey + ']');
@@ -1056,7 +1171,8 @@ async function handleInteraction(interaction) {
         const adminUser = ensureUser(guild, interaction.user.id);
 
         if (adminUser.activeBreak) {
-          await replyAdmin(interaction, errEmbed('Zaten aktif bir molanız var. Önce `/admin devam` ile bitirin.'));
+          const breakEndCmd = adminUser.activeBreak.isAdminBreak ? '`/admin devam`' : '`/devam`';
+          await replyAdmin(interaction, errEmbed('Zaten aktif bir molanız var. Önce ' + breakEndCmd + ' ile bitirin.'));
           await saveDb(db); return { outbox };
         }
 
@@ -1096,8 +1212,8 @@ async function handleInteraction(interaction) {
       if (sub === 'devam') {
         const adminUser = ensureUser(guild, interaction.user.id);
 
-        if (!adminUser.activeBreak) {
-          await replyAdmin(interaction, errEmbed('Aktif bir molanız bulunmuyor.'));
+        if (!adminUser.activeBreak || !adminUser.activeBreak.isAdminBreak) {
+          await replyAdmin(interaction, errEmbed('Aktif bir admin molanız bulunmuyor.'));
           await saveDb(db); return { outbox };
         }
 
@@ -1124,6 +1240,14 @@ async function handleInteraction(interaction) {
 
         await replyAdmin(interaction, okEmbed('Mola sonlandırıldı.' + (lateMin > 2 ? ' Geç kalma: **' + lateMin + ' dk**' : '')));
         await saveDb(db); return { outbox };
+      }
+
+      if (sub === 'restart') {
+        await replyAdmin(interaction, okEmbed('Bot yeniden başlatılıyor...'));
+        await saveDb(db);
+        logger.info('Admin restart komutu: ' + interaction.user.tag);
+        setTimeout(() => process.exit(0), 1000);
+        return { outbox };
       }
 
       await replyAdmin(interaction, errEmbed('Tanınmayan alt komut.'));
@@ -1248,7 +1372,7 @@ async function handleInteraction(interaction) {
       }
 
       const lastCreatedRez = (user.rez || [])
-        .filter((r) => r.createdAtMs && (r.status === 'pending' || r.status === 'started'))
+        .filter((r) => r.createdAtMs && !r.adminCreated && (r.status === 'pending' || r.status === 'started'))
         .sort((a, b) => b.createdAtMs - a.createdAtMs)[0];
       if (lastCreatedRez) {
         const cooldownMs = REZ_CREATION_COOLDOWN_MIN * 60 * 1000;
@@ -1665,7 +1789,7 @@ const maintenanceInterval = setInterval(() => {
     }
     await saveDb(db);
     setImmediate(() => flushOutbox(allOutbox));
-  }).catch((err) => logger.error('Maintenance error: ' + err.message));
+  }).catch((err) => logger.error('Maintenance error: ' + (err?.message || err)));
 }, 30 * 1000);
 
 // ===== Graceful Shutdown =====

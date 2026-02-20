@@ -115,6 +115,7 @@ const commands = [
   new SlashCommandBuilder()
     .setName('admin')
     .setDescription('Yönetici komutları')
+    .setDefaultMemberPermissions(0)
     .addSubcommand((sub) =>
       sub
         .setName('rapor')
@@ -122,8 +123,8 @@ const commands = [
         .addStringOption((opt) =>
           opt
             .setName('havuz')
-            .setDescription('Havuz seçimi')
-            .setRequired(true)
+            .setDescription('Havuz seçimi (boş bırakılırsa tüm havuzlar özeti)')
+            .setRequired(false)
             .addChoices(
               { name: 'Sabah', value: 'sabah' },
               { name: 'Akşam', value: 'aksam' },
@@ -161,7 +162,13 @@ const commands = [
         .addStringOption((opt) =>
           opt
             .setName('tarih')
-            .setDescription('Tarih (GG.AA.YYYY / bugun / dun)')
+            .setDescription('Başlangıç tarihi (GG.AA.YYYY / bugun / dun)')
+            .setRequired(false)
+        )
+        .addStringOption((opt) =>
+          opt
+            .setName('tarih2')
+            .setDescription('Bitiş tarihi — belirtilirse aralık gösterilir (GG.AA.YYYY / bugun / dun)')
             .setRequired(false)
         )
     )
@@ -301,13 +308,8 @@ const commands = [
             .setDescription('Mola süresi (dk)')
             .setRequired(true)
             .addChoices(
-              { name: '5 dk', value: 5 },
               { name: '10 dk', value: 10 },
-              { name: '15 dk', value: 15 },
-              { name: '20 dk', value: 20 },
-              { name: '30 dk', value: 30 },
-              { name: '45 dk', value: 45 },
-              { name: '60 dk', value: 60 }
+              { name: '20 dk', value: 20 }
             )
         )
     )
@@ -315,6 +317,11 @@ const commands = [
       sub
         .setName('devam')
         .setDescription('Kendi admin molasını bitir')
+    )
+    .addSubcommand((sub) =>
+      sub
+        .setName('restart')
+        .setDescription('Botu yeniden başlat')
     )
 ].map((c) => c.toJSON());
 
