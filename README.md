@@ -14,7 +14,7 @@ Bu bot; vardiyaya göre **6 farklı kanal** (3 vardiya × 2 kanal: *mola* + *rez
 - Rez başlangıcından sonra **5 dk içinde** mola başlatılmazsa rez **iptal** olur ve hak geri döner.
 - Mola bitince `/devam` yazılmazsa **10 dk sonra auto-close** olur.
 
-> Zaman dilimi: `TZ` ile belirlenir (varsayılan: `Europe/Berlin`).
+> Zaman dilimi: `TZ` ile belirlenir (varsayılan: `Europe/Istanbul`).
 
 ---
 
@@ -25,8 +25,6 @@ Bu bot; vardiyaya göre **6 farklı kanal** (3 vardiya × 2 kanal: *mola* + *rez
 - Discord bot token
 
 ### Dosyaları indir
-
-Bu klasörde:
 
 ```bash
 npm install
@@ -40,26 +38,31 @@ npm install
 cp .env.example .env
 ```
 
-`.env` içine şu alanları gir:
+`.env` içine şu alanları doldur:
 
-- `DISCORD_TOKEN`
-- `CLIENT_ID` (Discord Developer Portal → Application ID)
-- `GUILD_ID` (sunucu ID)
-- 6 kanal ID’si:
-  - `MORNING_MOLA_CHANNEL_ID`
-  - `MORNING_REZ_CHANNEL_ID`
-  - `EVENING_MOLA_CHANNEL_ID`
-  - `EVENING_REZ_CHANNEL_ID`
-  - `NIGHT_MOLA_CHANNEL_ID`
-  - `NIGHT_REZ_CHANNEL_ID`
+| Değişken | Açıklama |
+|---|---|
+| `DISCORD_TOKEN` | Discord Developer Portal → Bot → Token |
+| `CLIENT_ID` | Discord Developer Portal → Application ID |
+| `GUILD_ID` | Sunucu ID (Developer Mode → sunucuya sağ tık → Copy ID) |
+| `ADMIN_ROLE_ID` | Admin rolünün ID'si (virgülle birden fazla yazılabilir) |
+| `MORNING_MOLA_CHANNEL_ID` | Sabah vardiyası mola kanalı |
+| `MORNING_REZ_CHANNEL_ID` | Sabah vardiyası rez kanalı |
+| `EVENING_MOLA_CHANNEL_ID` | Akşam vardiyası mola kanalı |
+| `EVENING_REZ_CHANNEL_ID` | Akşam vardiyası rez kanalı |
+| `NIGHT_MOLA_CHANNEL_ID` | Gece vardiyası mola kanalı |
+| `NIGHT_REZ_CHANNEL_ID` | Gece vardiyası rez kanalı |
+| `ADMIN_BREAK_CHANNEL_IDS` | Admin molalarının duyurulacağı kanal(lar), virgülle ayrılır |
 
-> Kanal ID almak için Discord’da Developer Mode aç → kanala sağ tık → Copy ID.
+> Kanal ID almak için Discord'da Developer Mode aç → kanala sağ tık → Copy ID.
+
+> İkinci sunucu (Guild 2) için `.env.example` içindeki `G2_*` değişkenlerini doldur. Opsiyoneldir.
 
 ---
 
 ## 2) Slash Komutları Yükleme
 
-Discord’a komutları eklemek için:
+Discord'a komutları eklemek için:
 
 ```bash
 npm run deploy
@@ -75,6 +78,14 @@ Komutlar **guild** seviyesine yüklenir (anında görünür).
 npm start
 ```
 
+Sürekli çalışması için PM2 önerilir:
+
+```bash
+npm install -g pm2
+pm2 start index.js --name mola-bot
+pm2 save
+```
+
 ---
 
 ## 4) Nickname Vardiya Formatı
@@ -83,15 +94,13 @@ Bot, kullanıcı vardiyasını **nick** üzerinden okur.
 
 Nick içinde şu pattern olmalı:
 
-- `08.00 - 16.00`
-- `10.00 - 18.00`
-- `16.00 - 00.00`
-- `18.00 - 02.00`
-- `20.00 - 04.00`
-- `00.00 - 08.00`
+| Vardiya | Saatler |
+|---|---|
+| Sabah | `08.00 - 16.00` veya `10.00 - 18.00` |
+| Akşam | `16.00 - 00.00` veya `18.00 - 02.00` veya `20.00 - 04.00` |
+| Gece | `00.00 - 08.00` |
 
-Örnek nick:
-- `Ahmet | 16.00 - 00.00`
+Örnek nick: `Ahmet | 16.00 - 00.00`
 
 > Nokta yerine `:` da kabul edilir (`16:00 - 00:00`).
 
@@ -108,12 +117,14 @@ Nick içinde şu pattern olmalı:
   - `bekle:true` verilirse **bekleme listesine** ekler ve slot boşalınca ping atar.
 
 #### `/rezliste`
-- Kendi pending rez’lerini ve havuzun o anki durumunu gösterir.
+- Kendi pending rez'lerini ve havuzun o anki durumunu gösterir.
 
 #### `/reziptal`
 - Parametresiz: en yakın pending rezi iptal eder.
 - `saat:HH:MM`: o saatli rezi iptal eder.
-- `hepsi:true`: tüm pending rez’leri iptal eder.
+- `hepsi:true`: tüm pending rez'leri iptal eder.
+
+---
 
 ### Mola kanalı komutları
 
@@ -126,6 +137,10 @@ Nick içinde şu pattern olmalı:
 - Rez olmadan başlar.
 - Normal mola 1 saat kuralını bypass eder.
 
+#### `/ekstra sure:10`
+- Vardiya **dışında** kullanılır.
+- Yalnızca admin tarafından verilmiş ekstra hakla çalışır.
+
 #### `/devam`
 - Aktif molayı bitirir.
 - Mola bitişinden **2 dk** fazla geç kalındıysa geç kalma bilgisi yazar.
@@ -135,10 +150,30 @@ Nick içinde şu pattern olmalı:
 
 ---
 
+### Admin komutları (`/admin`)
+
+> Yalnızca `ADMIN_ROLE_ID` rolüne sahip kişiler veya sunucu yöneticileri kullanabilir.
+
+| Komut | Açıklama |
+|---|---|
+| `/admin rapor` | Vardiya mola raporu (günlük/haftalık/aylık) |
+| `/admin kullanici` | Belirli kullanıcının mola geçmişi |
+| `/admin hak-ver` | Kullanıcıya ekstra mola hakkı ver |
+| `/admin hak-al` | Kullanıcıdan mola hakkı al |
+| `/admin mola-bitir` | Kullanıcının aktif molasını zorla sonlandır |
+| `/admin rez-ver` | Kullanıcı adına rezervasyon oluştur (hak düşülmez) |
+| `/admin rez-iptal` | Kullanıcının rezervasyonunu iptal et |
+| `/admin mola-al` | Kendi admin molasını başlat (kural yok) |
+| `/admin devam` | Kendi admin molasını bitir |
+| `/admin restart` | Botu yeniden başlat |
+
+---
+
 ## 6) Kurallar Özeti
 
 - İlk 30 dk & son 30 dk içinde mola/rez yok.
 - Aynı kullanıcı için iki rez başlangıcı arası min **1 saat**.
+- Rez aldıktan sonra yeni rez alabilmek için **30 dk** bekleme.
 - Kapasite:
   - 10 dk: max 2
   - 20 dk: max 1
@@ -153,8 +188,14 @@ Bot veriyi aynı klasörde **data.json** içinde tutar (basit kalıcı DB). `git
 
 ---
 
-## 8) Notlar
+## 8) Bot İzinleri
 
-- Botun ilgili kanallara mesaj atabilmesi için `Send Messages` ve slash komutları kullanabilmesi için `Use Application Commands` izni olmalı.
-- Nickname okuyabilmesi için kullanıcıların nick’i sunucu içinde görünür olmalı.
+Botun çalışması için gereken Discord izinleri:
 
+- `Send Messages`
+- `Use Application Commands`
+- `Read Message History`
+- `View Channel`
+- `Manage Messages` (opsiyonel, ephemeral mesaj silme için)
+
+> Nickname okuyabilmesi için kullanıcıların nick'i sunucu içinde görünür olmalı.
