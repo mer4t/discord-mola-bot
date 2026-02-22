@@ -26,7 +26,7 @@ async function loadDb() {
       if (!parsed.guilds || typeof parsed.guilds !== 'object') parsed.guilds = {};
       _cache = parsed;
     }
-  } catch (err) {
+  } catch {
     _cache = defaultDb();
   }
   return _cache;

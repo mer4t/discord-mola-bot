@@ -39,7 +39,7 @@ function floorToMinuteMs(ms) {
   return Math.floor(ms / 60000) * 60000;
 }
 
-function buildShiftForDay(dayStartDt, schedule, zone) {
+function buildShiftForDay(dayStartDt, schedule) {
   const start = dayStartDt.set({ hour: schedule.start.hour, minute: schedule.start.minute, second: 0, millisecond: 0 });
   let end = dayStartDt.set({ hour: schedule.end.hour, minute: schedule.end.minute, second: 0, millisecond: 0 });
   if (end <= start) end = end.plus({ days: 1 });
@@ -51,10 +51,10 @@ function buildShiftForDay(dayStartDt, schedule, zone) {
  */
 function getShiftBoundsContainingNow(now, schedule, zone) {
   const today = now.setZone(zone).startOf('day');
-  let bounds = buildShiftForDay(today, schedule, zone);
+  let bounds = buildShiftForDay(today, schedule);
   if (now >= bounds.start && now < bounds.end) return bounds;
   const yesterday = today.minus({ days: 1 });
-  bounds = buildShiftForDay(yesterday, schedule, zone);
+  bounds = buildShiftForDay(yesterday, schedule);
   if (now >= bounds.start && now < bounds.end) return bounds;
   return null;
 }
@@ -63,7 +63,7 @@ function getShiftBoundsContainingNow(now, schedule, zone) {
  * Maps a HH:MM time to a concrete DateTime within the given shift bounds.
  * Returns null if the mapped time is outside shift.
  */
-function mapTimeToShift(time, shiftBounds, zone) {
+function mapTimeToShift(time, shiftBounds) {
   let candidate = shiftBounds.start.startOf('day').set({ hour: time.hour, minute: time.minute, second: 0, millisecond: 0 });
   if (candidate < shiftBounds.start) candidate = candidate.plus({ days: 1 });
   if (candidate < shiftBounds.start || candidate >= shiftBounds.end) return null;

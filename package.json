@@ -17,5 +17,8 @@
     "luxon": "^3.5.0",
     "winston": "^3.17.0",
     "winston-daily-rotate-file": "^5.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.1"
   }
 }
