@@ -1,11 +1,13 @@
 'use strict';
 
+const fs = require('fs');
 const path = require('path');
 const winston = require('winston');
 require('winston-daily-rotate-file');
 const { CONFIG } = require('./config');
 
 const LOG_DIR = path.join(__dirname, 'logs');
+fs.mkdirSync(LOG_DIR, { recursive: true });
 
 const timezoned = () => {
   const now = new Date();

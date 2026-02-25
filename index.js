@@ -117,14 +117,16 @@ function clampRights(user) {
 }
 
 function resetUserForNewShift(user, guild, userId, now) {
-  if (user.activeBreak) {
-    logBreakClose(user, user.activeBreak, 'auto', now);
+  // Ekstra molaları kapat değil — vardiya dışı başlatılmış, tamamlanmasına izin ver
+  // Normal/acil molalar ise kapatılır (eski vardiyadan kalan)
+  if (user.activeBreak && !user.activeBreak.isExtra) {
+    logBreakClose(user, user.activeBreak, 'reset', now);
+    user.activeBreak = null;
   }
   user.freeRights = { '10': 2, '20': 1 };
   // Preserve admin-created pending rezs that are still in the future (they were created without consuming rights)
   const nowMs = now.toMillis();
   user.rez = (user.rez || []).filter((r) => r.adminCreated && r.status === 'pending' && r.startAtMs > nowMs);
-  user.activeBreak = null;
   user.lastNormalBreakClosedAtMs = null;
   // Remove waitlist entries for this user
   guild.waitlist = (guild.waitlist || []).filter((w) => w.userId !== userId);
@@ -145,8 +147,9 @@ function poolKeyTR(key) {
  * Log a completed break into user's breakLog for reporting.
  */
 function logBreakClose(user, breakData, closedBy, now) {
-  // Use break start time for shiftDate to handle midnight-crossing shifts
-  const shiftDate = formatDate(DateTime.fromMillis(breakData.startAtMs).setZone(TZ));
+  // shiftStartDate: mola oluşturulurken kaydedilmiş vardiya başlangıç tarihi (midnight-crossing shift için doğru gün)
+  // Yoksa (eski veri / admin-break / ekstra) mola başlangıcının tarihini kullan
+  const shiftDate = breakData.shiftStartDate || formatDate(DateTime.fromMillis(breakData.startAtMs).setZone(TZ));
   user.breakLog.push({
     id: crypto.randomUUID(),
     poolKey: breakData.poolKey,
@@ -273,7 +276,7 @@ function canStartBreakNow(dbGuild, poolKey, duration, nowMs, exceptUserId) {
     if (!b) continue;
     if (b.poolKey !== poolKey) continue;
     if (b.typeMins !== duration) continue;
-    const endAtMs = b.autoCloseAtMs;
+    const endAtMs = b.autoCloseAtMs ?? (b.scheduledEndAtMs + AUTO_CLOSE_MS);
     if (nowMs >= b.startAtMs && nowMs < endAtMs) activeCount += 1;
   }
   if (activeCount >= limit) {
@@ -287,7 +290,7 @@ function canStartBreakNow(dbGuild, poolKey, duration, nowMs, exceptUserId) {
 function userHasRezStartConflict(user, candidateStartMs) {
   const oneHourMs = 60 * 60 * 1000;
   for (const r of user.rez || []) {
-    if (r.status !== 'pending') continue;
+    if (r.status !== 'pending' && r.status !== 'started') continue;
     const diff = Math.abs(r.startAtMs - candidateStartMs);
     if (diff < oneHourMs) return true;
   }
@@ -479,7 +482,7 @@ function runMaintenance(dbGuild, guildId, now) {
       const closeNow = DateTime.fromMillis(nowMs).setZone(TZ);
       logBreakClose(u, b, 'auto', closeNow);
       u.activeBreak = null;
-      if (!b.isAcil && !b.isAdminBreak) {
+      if (!b.isAcil && !b.isAdminBreak && !b.isExtra) {
         u.lastNormalBreakClosedAtMs = dueCloseAt;
       }
 
@@ -505,10 +508,12 @@ function runMaintenance(dbGuild, guildId, now) {
   }
 
   // 4) waitlist maintenance
-  dbGuild.waitlist = (dbGuild.waitlist || []).filter((w) => nowMs <= w.startAtMs);
-
+  // NOT: filtre ÖNCE değil SONRA uygulanır — startAtMs geçmiş ama hala RES_WINDOW_MS içindeyse bildirim gönderilebilir
   const remaining = [];
-  for (const w of dbGuild.waitlist || []) {
+  for (const w of (dbGuild.waitlist || [])) {
+    // Slot 5 dakikadan daha eski geçmişte — bildirim göndermeden sil
+    if (nowMs > w.startAtMs + RES_WINDOW_MS) continue;
+
     const u = dbGuild.users[w.userId];
     if (!u) continue;
 
@@ -520,6 +525,12 @@ function runMaintenance(dbGuild, guildId, now) {
 
     // rez 1h rule
     if (userHasRezStartConflict(u, w.startAtMs)) {
+      remaining.push(w);
+      continue;
+    }
+
+    // break cooldown rule
+    if (!userBreakCooldownConflict(u, w.startAtMs).ok) {
       remaining.push(w);
       continue;
     }
@@ -557,20 +568,32 @@ function runMaintenance(dbGuild, guildId, now) {
 
 async function flushOutbox(outbox) {
   for (const m of outbox) {
-    try {
-      let ch = client.channels.cache.get(m.channelId);
-      if (!ch) {
-        try { ch = await client.channels.fetch(m.channelId); } catch { /* channel not accessible */ }
-      }
-      if (ch && ch.isTextBased()) {
-        if (m.embeds) {
-          await ch.send({ embeds: m.embeds });
+    let sent = false;
+    for (let attempt = 0; attempt < 2 && !sent; attempt++) {
+      try {
+        let ch = client.channels.cache.get(m.channelId);
+        if (!ch) {
+          try { ch = await client.channels.fetch(m.channelId); } catch { /* channel not accessible */ }
+        }
+        if (ch && ch.isTextBased()) {
+          if (m.embeds && m.embeds.length) {
+            await ch.send({ embeds: m.embeds });
+          } else if (m.content) {
+            await ch.send(m.content);
+          } else {
+            break; // nothing to send
+          }
+          sent = true;
         } else {
-          await ch.send(m.content);
+          break; // channel not found — no point retrying
+        }
+      } catch (err) {
+        if (attempt === 0) {
+          await new Promise((r) => setTimeout(r, 500));
+        } else {
+          logger.warn('Mesaj gönderilemedi ch=' + m.channelId + ': ' + (err?.message || String(err)));
         }
       }
-    } catch (err) {
-      logger.warn('Mesaj gönderilemedi ch=' + m.channelId + ': ' + err.message);
     }
   }
 }
@@ -901,7 +924,7 @@ async function handleInteraction(interaction) {
             const end = DateTime.fromMillis(l.endAtMs).setZone(TZ).toFormat('HH:mm');
             const dur = String(l.duration).padStart(2) + 'dk';
             const late = l.lateMin > 0 ? (String(l.lateMin).padStart(3) + ' dk') : '  —   ';
-            const closed = l.closedBy === 'auto' ? 'auto-close' : l.closedBy === 'admin' ? 'admin     ' : '/devam    ';
+            const closed = l.closedBy === 'auto' ? 'auto-close' : l.closedBy === 'admin' ? 'admin     ' : l.closedBy === 'reset' ? 'vardiya   ' : '/devam    ';
             lines.push(type + ' ' + dateStr + '   ' + start + '      ' + end + '    ' + dur + '   ' + late + '  ' + closed);
           }
           lines.push('```');
@@ -963,6 +986,11 @@ async function handleInteraction(interaction) {
         const targetUserObj = ensureUser(guild, targetUser.id);
         const key = String(sure);
 
+        if (tur === 'normal' && sure === 5) {
+          await replyAdmin(interaction, errEmbed('Normal mola hakları yalnızca **10 dk** veya **20 dk** olabilir. 5 dk yalnızca ekstra hak türünde geçerlidir.'));
+          await saveDb(db); return { outbox };
+        }
+
         if (tur === 'normal') {
           const current = targetUserObj.freeRights[key] || 0;
           if (current <= 0) {
@@ -1004,7 +1032,7 @@ async function handleInteraction(interaction) {
         const b = targetUserObj.activeBreak;
         logBreakClose(targetUserObj, b, 'admin', now);
         targetUserObj.activeBreak = null;
-        if (!b.isAcil && !b.isAdminBreak) targetUserObj.lastNormalBreakClosedAtMs = now.toMillis();
+        if (!b.isAcil && !b.isAdminBreak && !b.isExtra) targetUserObj.lastNormalBreakClosedAtMs = now.toMillis();
 
         const breakLabel = b.isExtra ? 'ekstra' : b.isAcil ? 'acil' : 'normal';
         logger.info('Admin mola bitirdi: ' + interaction.user.tag + ' → ' + targetUser.tag + ' ' + b.typeMins + 'dk [' + b.poolKey + ']');
@@ -1039,7 +1067,7 @@ async function handleInteraction(interaction) {
         }
 
         const { bounds: shiftBounds } = shiftInfo;
-        const resStartDt = mapTimeToShift(parsed, shiftBounds, TZ);
+        const resStartDt = mapTimeToShift(parsed, shiftBounds);
         if (!resStartDt) {
           await replyAdmin(interaction, errEmbed('Belirtilen saat vardiya aralığının dışında.'));
           await saveDb(db); return { outbox };
@@ -1213,7 +1241,8 @@ async function handleInteraction(interaction) {
         const adminUser = ensureUser(guild, interaction.user.id);
 
         if (!adminUser.activeBreak || !adminUser.activeBreak.isAdminBreak) {
-          await replyAdmin(interaction, errEmbed('Aktif bir admin molanız bulunmuyor.'));
+          const hint = adminUser.activeBreak ? ' Normal mola için mola kanalından `/devam` kullanın.' : '';
+          await replyAdmin(interaction, errEmbed('Aktif bir admin molanız bulunmuyor.' + hint));
           await saveDb(db); return { outbox };
         }
 
@@ -1246,8 +1275,7 @@ async function handleInteraction(interaction) {
         await replyAdmin(interaction, okEmbed('Bot yeniden başlatılıyor...'));
         await saveDb(db);
         logger.info('Admin restart komutu: ' + interaction.user.tag);
-        setTimeout(() => process.exit(0), 1000);
-        return { outbox };
+        return { outbox, restart: true };
       }
 
       await replyAdmin(interaction, errEmbed('Tanınmayan alt komut.'));
@@ -1257,6 +1285,9 @@ async function handleInteraction(interaction) {
 
     if (result?.outbox?.length) {
       await flushOutbox(result.outbox);
+    }
+    if (result?.restart) {
+      process.exit(0);
     }
     return;
   }
@@ -1297,13 +1328,14 @@ async function handleInteraction(interaction) {
     const poolKey = channelPoolKey;
 
     if (!detected) {
-      await replyPrivate(interaction, errEmbed(
-        'Vardiya bilgisi algılanamadı. Lütfen nick formatını kontrol edin.\nÖrnek: `İsim | 16.00 - 00.00`\n\nGeçerli vardiyalar:\n' + getShiftExamplesText()
-      ));
-      return { outbox: [] };
-    }
-
-    if (detected.poolKey !== poolKey) {
+      // /devam aktif molayı sonlandırır — nick olmadan da çalışmalı
+      if (cmd !== 'devam') {
+        await replyPrivate(interaction, errEmbed(
+          'Vardiya bilgisi algılanamadı. Lütfen nick formatını kontrol edin.\nÖrnek: `İsim | 16.00 - 00.00`\n\nGeçerli vardiyalar:\n' + getShiftExamplesText()
+        ));
+        return { outbox: [] };
+      }
+    } else if (detected.poolKey !== poolKey) {
       await replyPrivate(interaction, errEmbed(
         'Kanal uyumsuzluğu — Bu kanal **' + poolKeyTR(poolKey) + '** havuzuna aittir. Vardiyanız: **' + poolKeyTR(detected.poolKey) + '**\n📌 Doğru kanal: <#' + (getGuildConfig(interaction.guildId)?.channels[detected.poolKey]?.[type]?.[0] || '') + '>'
       ));
@@ -1311,7 +1343,7 @@ async function handleInteraction(interaction) {
     }
 
     const now = getNow();
-    const shiftBounds = getShiftBoundsContainingNow(now, detected.schedule, TZ);
+    const shiftBounds = detected ? getShiftBoundsContainingNow(now, detected.schedule, TZ) : null;
 
     const user = ensureUser(guild, interaction.user.id);
     const outbox = runMaintenance(guild, guildId, now);
@@ -1348,7 +1380,7 @@ async function handleInteraction(interaction) {
       const parsed = parseHHMM(timeStr);
       if (!parsed) { await replyPrivate(interaction, errEmbed('Geçersiz saat formatı.\nÖrnek: `13:40` veya `13.40`')); await saveDb(db); return { outbox }; }
 
-      const resStartDt = mapTimeToShift(parsed, shiftBounds, TZ);
+      const resStartDt = mapTimeToShift(parsed, shiftBounds);
       if (!resStartDt) { await replyPrivate(interaction, errEmbed('Belirtilen saat vardiya aralığının dışında.')); await saveDb(db); return { outbox }; }
 
       const nowMs = now.toMillis();
@@ -1519,7 +1551,7 @@ async function handleInteraction(interaction) {
       const scheduledEndAtMs = rez.endAtMs;
       const effectiveMin = Math.floor((scheduledEndAtMs - startAtMs) / 60000);
 
-      user.activeBreak = { id: crypto.randomUUID(), poolKey, typeMins: duration, startAtMs, scheduledEndAtMs, autoCloseAtMs: scheduledEndAtMs + AUTO_CLOSE_MS, isAcil: false, rezId: rez.id };
+      user.activeBreak = { id: crypto.randomUUID(), poolKey, typeMins: duration, startAtMs, scheduledEndAtMs, autoCloseAtMs: scheduledEndAtMs + AUTO_CLOSE_MS, isAcil: false, rezId: rez.id, shiftStartDate: formatDate(shiftBounds.start) };
 
       const endDt = DateTime.fromMillis(scheduledEndAtMs).setZone(TZ);
       let msg = mention(interaction.user.id) + ' — Mola başladı — **' + duration + ' dk** | Bitiş: **' + formatHM(endDt) + '**\nBitince: `/devam`';
@@ -1542,7 +1574,8 @@ async function handleInteraction(interaction) {
       const nowMs = now.toMillis();
       const earliest = shiftBounds.start.plus({ minutes: FIRST_LAST_BLOCK_MIN });
       const latestEnd = shiftBounds.end.minus({ minutes: FIRST_LAST_BLOCK_MIN });
-      const endDt = now.plus({ minutes: duration });
+      // Gerçek bitiş zamanı: floor(now) + duration — saniye/ms hassasiyeti kaldırıldı
+      const endDt = DateTime.fromMillis(floorToMinuteMs(nowMs) + duration * 60 * 1000).setZone(TZ);
 
       if (now < earliest) { await replyPrivate(interaction, errEmbed('Vardiyanın ilk 30 dakikasında mola kullanılamaz.')); await saveDb(db); return { outbox }; }
       if (endDt > latestEnd) { await replyPrivate(interaction, errEmbed('Bu mola vardiya sonundaki kısıtlı alana taşmaktadır.')); await saveDb(db); return { outbox }; }
@@ -1559,7 +1592,7 @@ async function handleInteraction(interaction) {
       const startAtMs = floorToMinuteMs(nowMs);
       const scheduledEndAtMs = startAtMs + duration * 60 * 1000;
 
-      user.activeBreak = { id: crypto.randomUUID(), poolKey, typeMins: duration, startAtMs, scheduledEndAtMs, autoCloseAtMs: scheduledEndAtMs + AUTO_CLOSE_MS, isAcil: true };
+      user.activeBreak = { id: crypto.randomUUID(), poolKey, typeMins: duration, startAtMs, scheduledEndAtMs, autoCloseAtMs: scheduledEndAtMs + AUTO_CLOSE_MS, isAcil: true, shiftStartDate: formatDate(shiftBounds.start) };
 
       const end = DateTime.fromMillis(scheduledEndAtMs).setZone(TZ);
       logger.info('Acil mola başladı: ' + interaction.user.tag + ' ' + duration + 'dk bitiş=' + formatHM(end) + ' [' + poolKeyTR(poolKey) + ']');
@@ -1591,7 +1624,7 @@ async function handleInteraction(interaction) {
       const startAtMs = floorToMinuteMs(nowMs);
       const scheduledEndAtMs = startAtMs + duration * 60 * 1000;
 
-      user.activeBreak = { id: crypto.randomUUID(), poolKey, typeMins: duration, startAtMs, scheduledEndAtMs, autoCloseAtMs: scheduledEndAtMs + AUTO_CLOSE_MS, isAcil: true, isExtra: true };
+      user.activeBreak = { id: crypto.randomUUID(), poolKey, typeMins: duration, startAtMs, scheduledEndAtMs, autoCloseAtMs: scheduledEndAtMs + AUTO_CLOSE_MS, isAcil: false, isExtra: true };
 
       const end = DateTime.fromMillis(scheduledEndAtMs).setZone(TZ);
       logger.info('Ekstra mola başladı: ' + interaction.user.tag + ' ' + duration + 'dk bitiş=' + formatHM(end) + ' [' + poolKeyTR(poolKey) + ']');
@@ -1612,14 +1645,20 @@ async function handleInteraction(interaction) {
       const closeAtMs = floorToMinuteMs(nowMs);
       logBreakClose(user, b, 'user', now);
       user.activeBreak = null;
-      if (!b.isAcil && !b.isAdminBreak) user.lastNormalBreakClosedAtMs = closeAtMs;
+      if (!b.isAcil && !b.isAdminBreak && !b.isExtra) user.lastNormalBreakClosedAtMs = closeAtMs;
 
       let embed;
       if (lateMin > 2) { embed = warnEmbed(mention(interaction.user.id) + ' — Mola sonlandırıldı.\n⏳ Geç kalma süresi: **' + lateMin + ' dk**'); }
       else { embed = okEmbed(mention(interaction.user.id) + ' — Mola sonlandırıldı. İyi çalışmalar.'); }
 
-      logger.info('Mola bitti: ' + interaction.user.tag + ' ' + b.typeMins + 'dk geç=' + lateMin + 'dk [' + poolKeyTR(poolKey) + ']');
-      await replyPublic(interaction, embed);
+      logger.info('Mola bitti: ' + interaction.user.tag + ' ' + b.typeMins + 'dk geç=' + lateMin + 'dk [' + poolKeyTR(b.poolKey || poolKey) + ']');
+      if (b.poolKey && b.poolKey !== poolKey) {
+        // Break started in a different pool — send public message to the correct pool channel
+        pushToPool(outbox, guildId, b.poolKey, 'mola', [embed]);
+        await replyPrivate(interaction, okEmbed('Mola sonlandırıldı.' + (lateMin > 2 ? ' Geç kalma: **' + lateMin + ' dk**' : '')));
+      } else {
+        await replyPublic(interaction, embed);
+      }
       await saveDb(db); return { outbox };
     }
 
@@ -1627,14 +1666,19 @@ async function handleInteraction(interaction) {
     if (cmd === 'hak') {
       const free10 = user.freeRights['10'] || 0;
       const free20 = user.freeRights['20'] || 0;
-      const reserved10 = (user.rez || []).filter((r) => r.status === 'pending' && r.duration === 10 && r.poolKey === poolKey).length;
-      const reserved20 = (user.rez || []).filter((r) => r.status === 'pending' && r.duration === 20 && r.poolKey === poolKey).length;
+      // Sadece hak düşen (kullanıcı oluşturduğu) rezler sayılır — admin oluşturduğu rezler hak tüketmez
+      const reserved10 = (user.rez || []).filter((r) => r.status === 'pending' && r.duration === 10 && r.poolKey === poolKey && !r.adminCreated).length;
+      const reserved20 = (user.rez || []).filter((r) => r.status === 'pending' && r.duration === 20 && r.poolKey === poolKey && !r.adminCreated).length;
+      const adminRez10 = (user.rez || []).filter((r) => r.status === 'pending' && r.duration === 10 && r.poolKey === poolKey && r.adminCreated).length;
+      const adminRez20 = (user.rez || []).filter((r) => r.status === 'pending' && r.duration === 20 && r.poolKey === poolKey && r.adminCreated).length;
       const used10 = 2 - free10 - reserved10;
       const used20 = 1 - free20 - reserved20;
 
       const lines = [];
       lines.push('Boş: **10dk × ' + free10 + '** · **20dk × ' + free20 + '**');
-      lines.push('Rezerve: **10dk × ' + reserved10 + '** · **20dk × ' + reserved20 + '**');
+      let rezLine = 'Rezerve: **10dk × ' + reserved10 + '** · **20dk × ' + reserved20 + '**';
+      if (adminRez10 > 0 || adminRez20 > 0) rezLine += '  *(+ admin: 10dk×' + adminRez10 + ' · 20dk×' + adminRez20 + ')*';
+      lines.push(rezLine);
       lines.push('Kullanılan: **10dk × ' + Math.max(0, used10) + '** · **20dk × ' + Math.max(0, used20) + '**');
 
       const extraEntries = Object.entries(user.extraRights || {}).filter(([, v]) => v > 0);
@@ -1788,7 +1832,7 @@ const maintenanceInterval = setInterval(() => {
       allOutbox.push(...outbox);
     }
     await saveDb(db);
-    setImmediate(() => flushOutbox(allOutbox));
+    setImmediate(() => flushOutbox(allOutbox).catch((err) => logger.error('OutboxFlush error: ' + (err?.message || String(err)))));
   }).catch((err) => logger.error('Maintenance error: ' + (err?.message || err)));
 }, 30 * 1000);
 
@@ -1817,7 +1861,7 @@ async function gracefulShutdown(signal, exitCode = 0) {
     await flushAndClose();
     logger.info('Database kaydedildi.');
   } catch (err) {
-    logger.error('Shutdown sırasında DB hatası: ' + err.message);
+    logger.error('Shutdown sırasında DB hatası: ' + (err?.message || String(err)));
   }
 
   try {
@@ -1860,7 +1904,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     } catch {
       // ignore
     }
-    logger.error('Interaction error: ' + err.stack);
+    logger.error('Interaction error: ' + (err?.stack || String(err)));
   }
 });
 

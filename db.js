@@ -48,7 +48,16 @@ let mutex = Promise.resolve();
  * @returns {Promise<T>}
  */
 function withDbLock(fn) {
-  const run = mutex.then(fn, fn);
+  const wrapped = async () => {
+    try {
+      return await fn();
+    } catch (err) {
+      // Mutation may have left _cache in a partial state — force re-read from disk next time
+      _cache = null;
+      throw err;
+    }
+  };
+  const run = mutex.then(wrapped, wrapped);
   // Keep chain alive even if fn throws
   mutex = run.catch(() => undefined);
   return run;
@@ -78,8 +87,10 @@ function ensureUser(guild, userId) {
     };
   }
   const u = guild.users[userId];
-  if (!u.freeRights) u.freeRights = { '10': 0, '20': 0 };
-  if (!u.extraRights || typeof u.extraRights !== 'object') u.extraRights = {};
+  if (!u.freeRights || typeof u.freeRights !== 'object' || Array.isArray(u.freeRights)) u.freeRights = { '10': 0, '20': 0 };
+  if (typeof u.freeRights['10'] !== 'number') u.freeRights['10'] = 0;
+  if (typeof u.freeRights['20'] !== 'number') u.freeRights['20'] = 0;
+  if (!u.extraRights || typeof u.extraRights !== 'object' || Array.isArray(u.extraRights)) u.extraRights = {};
   if (!Array.isArray(u.rez)) u.rez = [];
   if (!('activeBreak' in u)) u.activeBreak = null;
   if (!('lastNormalBreakClosedAtMs' in u)) u.lastNormalBreakClosedAtMs = null;
